@@ -1,4 +1,4 @@
-# Football Ad Muter
+# Football Ads Muter
 
 Detects whether a browser stream is showing football or ads by sampling the screen, then fades browser audio down during ads and restores it instantly when football returns.
 
