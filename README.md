@@ -18,6 +18,8 @@ The script uses:
 
 You do not need to install them manually when using the `uv run --with ...` command below.
 
+Recorded screenshots, logs, and trained model files are intentionally ignored by Git. They can contain private screen contents and should stay local unless you explicitly choose to share them.
+
 ## Run
 
 From this folder:
@@ -34,6 +36,7 @@ Useful options:
 - `--context-grace 4`: keep closeups, crowd shots, and camera switches protected briefly after real play.
 - `--mute-fade 2`: fade browser volume to zero over 2 seconds.
 - `--record-data data/session-1`: save sampled browser screenshots and feature rows for training.
+- `--auto-label`: fill the training label column with conservative automatic labels.
 - `--model models/football_ad_classifier.joblib`: use a trained local model instead of the heuristic decision.
 - `--model-threshold 0.65`: require this much model confidence before treating a frame as football.
 - `--no-debug`: disable the OpenCV preview window and use terminal logs only.
@@ -50,6 +53,12 @@ Run a normal match session with recording enabled:
 
 ```powershell
 uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib python football_ad_muter.py --monitor 2 --duration 1800 --record-data data/session-1 --no-debug
+```
+
+For bootstrap training without manual labels, add `--auto-label`:
+
+```powershell
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib python football_ad_muter.py --monitor 2 --duration 1800 --record-data data/session-1 --auto-label --no-debug
 ```
 
 This creates:
@@ -111,6 +120,12 @@ You do not need to label every frame. Start with a balanced set, for example 100
 uv run --with scikit-learn --with joblib python train_model.py data/session-1/labels.csv --output models/football_ad_classifier.joblib
 ```
 
+If you used `--auto-label`, the same command works because the `label` column is already filled. For older recordings with blank labels, you can bootstrap from the predicted column:
+
+```powershell
+uv run --with scikit-learn --with joblib python train_model.py data/session-1/labels.csv --use-predicted --output models/football_ad_classifier.joblib
+```
+
 You can train from multiple sessions:
 
 ```powershell
@@ -133,6 +148,40 @@ The improvement loop is:
 record browser frames -> label useful examples -> train -> run model -> collect mistakes -> retrain
 ```
 
+## Self-training bootstrap
+
+To let the project collect conservative automatic labels and retrain after each recording chunk:
+
+```powershell
+uv run --with opencv-python --with mss --with numpy --with pycaw --with scikit-learn --with joblib python self_train.py --monitor 1 --chunk-duration 600
+```
+
+Use the monitor number where the browser stream is visible. The model is saved to `models/football_ad_classifier.joblib` and reused on the next collection cycle.
+
+This is a bootstrap loop, not perfect supervision. It gets the model started, but the biggest accuracy gains still come from reviewing `data/self-train/*/labels.csv`, correcting wrong labels with `label_frames.py --all`, and retraining.
+
+## Football-only anomaly model
+
+If the other monitor is currently showing only football/highlights and no ads, train a one-class model instead. This learns "normal football" and treats future non-football screens as anomalies.
+
+Record football-only examples:
+
+```powershell
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib python football_ad_muter.py --monitor 2 --duration 600 --record-data data/football-only/session-1 --assume-label football --no-debug
+```
+
+Train the one-class model:
+
+```powershell
+uv run --with scikit-learn --with joblib python train_one_class.py data/football-only/session-1/labels.csv --output models/football_one_class.joblib
+```
+
+Run with it:
+
+```powershell
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.5 --record-data data/football-only/session-2 --no-debug
+```
+
 ## Logs
 
 The script prints one line per sampled frame, including:
@@ -142,9 +191,19 @@ The script prints one line per sampled frame, including:
 - `BoardDensity` / `BoardTile`: scoreboard detector debug values.
 - `Ball`: experimental white-ball candidate signal, logged for debugging.
 - `ReplayRule`: whether green replay/play footage was detected without relying on the scoreboard.
+- `Lines`: white pitch-line signal near green areas.
+- `SceneCut`: frame-to-frame color-layout change score.
 - `Context`: whether recent football context is protecting closeups/cutaways.
 - `ScoreboardContext`: whether the scoreboard is helping classify the frame as football.
 - `Muted`: current audio state.
+
+Recorded training rows also include 3x3 regional layout features:
+
+- `grid_green_*`: where green pitch appears in the frame.
+- `grid_motion_*`: where motion appears in the frame.
+- `grid_edge_*`: where visual structure/text/lines appear in the frame.
+
+The trainers automatically use these newer columns when present. Older recordings still work; they train with the feature columns they contain.
 
 ## Tuning
 

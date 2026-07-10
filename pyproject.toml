@@ -1,0 +1,17 @@
+[project]
+name = "football-ads-muter"
+version = "0.1.0"
+description = "Detect football coverage from a browser screen capture and mute browser audio during non-football segments."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "joblib",
+    "mss",
+    "numpy",
+    "opencv-python",
+    "pycaw; platform_system == 'Windows'",
+    "scikit-learn",
+]
+
+[tool.ruff]
+line-length = 120

@@ -33,6 +33,15 @@ SHOW_DEBUG = True
 
 MODEL_THRESHOLD = 0.65
 UNKNOWN_SECONDS = 999.0
+GRID_ROWS = 3
+GRID_COLS = 3
+
+GRID_FEATURE_NAMES = [
+    f"grid_{metric}_r{row}c{col}"
+    for metric in ("green", "motion", "edge")
+    for row in range(GRID_ROWS)
+    for col in range(GRID_COLS)
+]
 
 FEATURE_NAMES = [
     "green",
@@ -48,6 +57,9 @@ FEATURE_NAMES = [
     "scoreboard_support",
     "seconds_since_strong",
     "seconds_since_scoreboard",
+    "pitch_line_score",
+    "scene_change_score",
+    *GRID_FEATURE_NAMES,
 ]
 
 CSV_FIELDS = [
@@ -60,6 +72,9 @@ CSV_FIELDS = [
     "muted",
     "label",
 ]
+
+FOOTBALL_AUTO_LABEL_MIN_GREEN = 0.18
+AD_AUTO_LABEL_MAX_GREEN = 0.08
 
 
 def log(message):
@@ -234,6 +249,89 @@ def ball_present(frame):
 
 
 # -----------------------------
+# Higher-quality visual features
+# -----------------------------
+
+def green_mask(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, np.array([35, 40, 40]), np.array([90, 255, 255]))
+
+
+def pitch_line_score(frame):
+    h, w = frame.shape[:2]
+    small_w = 640
+    small_h = max(1, int(h * (small_w / w)))
+    small = cv2.resize(frame, (small_w, small_h))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+
+    green = cv2.inRange(hsv, np.array([35, 40, 40]), np.array([90, 255, 255]))
+    white = cv2.inRange(hsv, np.array([0, 0, 170]), np.array([180, 60, 255]))
+    white[:int(small_h * 0.12), :] = 0
+
+    nearby_green = cv2.dilate(green, np.ones((13, 13), np.uint8), iterations=1)
+    candidates = cv2.bitwise_and(white, nearby_green)
+    edges = cv2.Canny(candidates, 50, 150)
+    min_line_length = max(25, small_w // 20)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=25, minLineLength=min_line_length, maxLineGap=8)
+
+    if lines is None:
+        return 0.0
+
+    total_length = 0.0
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4)[:40]:
+        total_length += float(np.hypot(x2 - x1, y2 - y1))
+
+    return min(1.0, total_length / (small_w * 1.5))
+
+
+previous_hist = None
+
+
+def scene_change_score(frame):
+    global previous_hist
+
+    small = cv2.resize(frame, (160, 90))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+
+    if previous_hist is None:
+        previous_hist = hist
+        return 0.0
+
+    correlation = cv2.compareHist(previous_hist, hist, cv2.HISTCMP_CORREL)
+    previous_hist = hist
+    return round(float(max(0.0, min(1.0, 1.0 - correlation))), 6)
+
+
+def regional_features(frame, previous_gray_frame):
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    green = green_mask(frame)
+    edges = cv2.Canny(gray, 80, 160)
+    diff = cv2.absdiff(previous_gray_frame, gray) if previous_gray_frame is not None else None
+    features = {}
+
+    for row in range(GRID_ROWS):
+        for col in range(GRID_COLS):
+            y1 = row * h // GRID_ROWS
+            y2 = (row + 1) * h // GRID_ROWS
+            x1 = col * w // GRID_COLS
+            x2 = (col + 1) * w // GRID_COLS
+            cell_area = max(1, (y2 - y1) * (x2 - x1))
+            suffix = f"r{row}c{col}"
+
+            features[f"grid_green_{suffix}"] = round(float(np.count_nonzero(green[y1:y2, x1:x2]) / cell_area), 6)
+            features[f"grid_edge_{suffix}"] = round(float(np.count_nonzero(edges[y1:y2, x1:x2]) / cell_area), 6)
+            if diff is None:
+                features[f"grid_motion_{suffix}"] = 999.0
+            else:
+                features[f"grid_motion_{suffix}"] = round(float(np.mean(diff[y1:y2, x1:x2])), 6)
+
+    return features
+
+
+# -----------------------------
 # Crowd detection
 # -----------------------------
 
@@ -281,11 +379,6 @@ def load_classifier(path):
         log(f"model file {model_path} is not a football classifier bundle")
         return None
 
-    missing = [name for name in FEATURE_NAMES if name not in bundle.get("feature_names", [])]
-    if missing:
-        log(f"model file is missing expected features: {', '.join(missing)}")
-        return None
-
     log(f"loaded local classifier from {model_path}")
     return bundle
 
@@ -293,8 +386,15 @@ def load_classifier(path):
 def model_probability(bundle, features):
     model = bundle["model"]
     feature_names = bundle["feature_names"]
+    kind = bundle.get("kind", "binary")
     labels = list(bundle.get("labels", []))
     values = [[features[name] for name in feature_names]]
+
+    if kind == "one_class_football":
+        score = float(model.score_samples(values)[0])
+        threshold = float(bundle["threshold"])
+        scale = max(0.000001, float(bundle.get("score_scale", 1.0)))
+        return max(0.0, min(1.0, 0.5 + ((score - threshold) / scale)))
 
     if hasattr(model, "predict_proba") and "football" in labels:
         probabilities = model.predict_proba(values)[0]
@@ -337,7 +437,26 @@ def prepare_recorder(record_dir, args):
     }
 
 
-def record_sample(recorder, frame, features, heuristic_probability, model_prob, predicted, muted):
+def automatic_label(features, heuristic_football):
+    if heuristic_football and (
+        features["green"] >= FOOTBALL_AUTO_LABEL_MIN_GREEN
+        or features["replay_rule"]
+        or (features["scoreboard"] and features["motion"])
+    ):
+        return "football"
+
+    if (
+        not heuristic_football
+        and features["green"] <= AD_AUTO_LABEL_MAX_GREEN
+        and not features["scoreboard"]
+        and not features["replay_rule"]
+    ):
+        return "ad"
+
+    return ""
+
+
+def record_sample(recorder, frame, features, heuristic_probability, model_prob, predicted, muted, label=""):
     if not recorder:
         return
 
@@ -353,7 +472,7 @@ def record_sample(recorder, frame, features, heuristic_probability, model_prob, 
         "model_probability": "" if model_prob is None else round(model_prob, 5),
         "predicted": predicted,
         "muted": int(muted),
-        "label": "",
+        "label": label,
     }
     row.update({name: features[name] for name in FEATURE_NAMES})
     recorder["writer"].writerow(row)
@@ -402,6 +521,17 @@ def parse_args():
         type=str,
         default=None,
         help="Directory where frames and labels.csv should be saved for local training.",
+    )
+    parser.add_argument(
+        "--auto-label",
+        action="store_true",
+        help="Fill labels.csv with conservative automatic labels for bootstrap training.",
+    )
+    parser.add_argument(
+        "--assume-label",
+        choices=["football", "ad"],
+        default=None,
+        help="Fill every recorded row with this label. Useful for one-class football training during highlights.",
     )
     parser.add_argument(
         "--model",
@@ -467,6 +597,9 @@ def main():
 
             green = pitch_score(frame)
             board, board_density, board_tile = scoreboard_present(frame)
+            line_score = pitch_line_score(frame)
+            scene_score = scene_change_score(frame)
+            grid_features = regional_features(frame, previous)
             motion_score = crowd_motion_score(frame)
             motion = motion_score > 4
             ball = ball_present(frame)
@@ -525,7 +658,10 @@ def main():
                 "scoreboard_support": int(scoreboard_supported_by_match),
                 "seconds_since_strong": round(float(seconds_since_strong), 3),
                 "seconds_since_scoreboard": round(float(seconds_since_scoreboard), 3),
+                "pitch_line_score": round(float(line_score), 6),
+                "scene_change_score": round(float(scene_score), 6),
             }
+            features.update(grid_features)
 
             model_prob = None
             if classifier:
@@ -557,6 +693,7 @@ def main():
                 f"Pitch: {green:.2f} | Scoreboard: {board} | Motion: {motion} | "
                 f"BoardDensity: {board_density:.3f} | BoardTile: {board_tile:.3f} | "
                 f"Ball: {ball} | ReplayRule: {replay_or_close_play} | "
+                f"Lines: {line_score:.2f} | SceneCut: {scene_score:.2f} | "
                 f"Context: {recent_match_context} | ScoreboardContext: {scoreboard_match_context} | "
                 f"ScoreboardSupport: {scoreboard_supported_by_match} | "
             )
@@ -573,6 +710,7 @@ def main():
                 model_prob,
                 "football" if football else "ad",
                 muted,
+                args.assume_label or (automatic_label(features, heuristic_football) if args.auto_label else ""),
             )
 
             if show_debug:

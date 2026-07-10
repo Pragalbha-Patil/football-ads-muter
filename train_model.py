@@ -8,7 +8,17 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
 
-FEATURE_NAMES = [
+GRID_ROWS = 3
+GRID_COLS = 3
+
+GRID_FEATURE_NAMES = [
+    f"grid_{metric}_r{row}c{col}"
+    for metric in ("green", "motion", "edge")
+    for row in range(GRID_ROWS)
+    for col in range(GRID_COLS)
+]
+
+BASE_FEATURE_NAMES = [
     "green",
     "scoreboard",
     "board_density",
@@ -23,6 +33,20 @@ FEATURE_NAMES = [
     "seconds_since_strong",
     "seconds_since_scoreboard",
 ]
+
+EXTRA_FEATURE_NAMES = [
+    "pitch_line_score",
+    "scene_change_score",
+    *GRID_FEATURE_NAMES,
+]
+
+FEATURE_NAMES = [*BASE_FEATURE_NAMES, *EXTRA_FEATURE_NAMES]
+
+FEATURE_DEFAULTS = {
+    "pitch_line_score": 0.0,
+    "scene_change_score": 0.0,
+    **{name: 0.0 for name in GRID_FEATURE_NAMES},
+}
 
 FOOTBALL_LABELS = {"football", "match", "play", "replay", "closeup", "crowd", "studio_football"}
 AD_LABELS = {"ad", "ads", "advert", "advertisement", "commercial", "break", "non_football"}
@@ -42,29 +66,52 @@ def normalize_label(label):
     raise ValueError(f"unsupported label: {label!r}")
 
 
-def load_rows(csv_paths):
-    rows = []
+def available_feature_names(csv_paths):
+    fieldnames = set()
 
     for csv_path in csv_paths:
         with Path(csv_path).open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
-            missing = [name for name in FEATURE_NAMES + ["label"] if name not in reader.fieldnames]
+            fieldnames.update(reader.fieldnames or [])
+
+    missing_base = [name for name in BASE_FEATURE_NAMES if name not in fieldnames]
+    if missing_base:
+        raise ValueError(f"training CSVs are missing base feature columns: {', '.join(missing_base)}")
+
+    return [*BASE_FEATURE_NAMES, *[name for name in EXTRA_FEATURE_NAMES if name in fieldnames]]
+
+
+def load_rows(csv_paths, use_predicted=False):
+    rows = []
+    feature_names = available_feature_names(csv_paths)
+
+    for csv_path in csv_paths:
+        with Path(csv_path).open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            missing = [name for name in ["label"] if name not in reader.fieldnames]
             if missing:
                 raise ValueError(f"{csv_path} is missing columns: {', '.join(missing)}")
 
             for row_number, row in enumerate(reader, start=2):
-                label = normalize_label(row.get("label", ""))
+                raw_label = row.get("label", "")
+                if use_predicted and not raw_label.strip():
+                    raw_label = row.get("predicted", "")
+
+                label = normalize_label(raw_label)
                 if label is None:
                     continue
 
                 try:
-                    features = [float(row[name]) for name in FEATURE_NAMES]
+                    features = [
+                        float(row.get(name, FEATURE_DEFAULTS.get(name, 0.0)) or FEATURE_DEFAULTS.get(name, 0.0))
+                        for name in feature_names
+                    ]
                 except ValueError as exc:
                     raise ValueError(f"{csv_path}:{row_number} has invalid feature values") from exc
 
                 rows.append((features, label))
 
-    return rows
+    return rows, feature_names
 
 
 def parse_args():
@@ -91,12 +138,17 @@ def parse_args():
         default=300,
         help="Number of random forest trees.",
     )
+    parser.add_argument(
+        "--use-predicted",
+        action="store_true",
+        help="Use the predicted column when label is blank. Useful only for heuristic bootstrap training.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    rows = load_rows(args.csv)
+    rows, feature_names = load_rows(args.csv, args.use_predicted)
 
     if len(rows) < 10:
         raise SystemExit("Need at least 10 labeled rows before training. More is better; a few hundred is a good start.")
@@ -131,6 +183,7 @@ def main():
 
     print(f"trained on {len(x_train)} rows")
     print(f"label counts: {label_counts}")
+    print(f"features used: {len(feature_names)}")
 
     if x_test:
         predictions = model.predict(x_test)
@@ -145,7 +198,7 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     bundle = {
         "model": model,
-        "feature_names": FEATURE_NAMES,
+        "feature_names": feature_names,
         "labels": list(model.classes_),
         "label_counts": label_counts,
     }
