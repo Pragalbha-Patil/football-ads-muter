@@ -98,13 +98,13 @@ This repo includes `models/football_one_class.joblib`, a starter one-class model
 Run it against the monitor where the browser stream is visible:
 
 ```powershell
-uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib --with scikit-learn python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.5 --mute-after 3 --record-data data/live-test --no-debug
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib --with scikit-learn python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.65 --mute-after 3 --record-data data/live-test --no-debug
 ```
 
 Tune from there:
 
-- If it mutes during football, try `--model-threshold 0.45`.
-- If it misses non-football breaks, try `--model-threshold 0.55` or `0.6`.
+- If it mutes during football, try `--model-threshold 0.55` or `0.6`.
+- If it misses non-football breaks, try `--model-threshold 0.7`.
 
 Only load `.joblib` model files from sources you trust. Joblib uses Python pickle under the hood.
 
@@ -261,7 +261,7 @@ uv run --with scikit-learn --with joblib python train_one_class.py data/football
 Run with it:
 
 ```powershell
-uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib --with scikit-learn python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.5 --record-data data/football-only/session-2 --no-debug
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib --with scikit-learn python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.65 --record-data data/football-only/session-2 --no-debug
 ```
 
 ## Logs
@@ -277,6 +277,7 @@ The script prints one line per sampled frame, including:
 - `SceneCut`: frame-to-frame color-layout change score.
 - `Context`: whether recent football context is protecting closeups/cutaways.
 - `ScoreboardContext`: whether the scoreboard is helping classify the frame as football.
+- `AdBreakReset`: whether a sharp low-pitch cut cleared stale match context and forced non-football.
 - `Muted`: current audio state.
 
 Recorded training rows also include 3x3 regional layout features:
@@ -289,7 +290,7 @@ The trainers automatically use these newer columns when present. Older recording
 
 ## Tuning
 
-If ads are classified as football, lower `--context-grace` or increase the green threshold constants in `football_ad_muter.py`.
+If ads are classified as football, watch for `AdBreakReset: True` when the ad starts. If it does not trigger, lower `AD_BREAK_GREEN_THRESHOLD` / `AD_BREAK_SCENE_CHANGE_THRESHOLD` carefully or lower `--context-grace`.
 
 If football closeups or replay shots get muted, increase `--context-grace` slightly, for example:
 

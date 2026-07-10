@@ -35,6 +35,7 @@ BASE_FEATURE_NAMES = [
 ]
 
 EXTRA_FEATURE_NAMES = [
+    "ad_break_reset",
     "pitch_line_score",
     "scene_change_score",
     *GRID_FEATURE_NAMES,
@@ -43,6 +44,7 @@ EXTRA_FEATURE_NAMES = [
 FEATURE_NAMES = [*BASE_FEATURE_NAMES, *EXTRA_FEATURE_NAMES]
 
 FEATURE_DEFAULTS = {
+    "ad_break_reset": 0.0,
     "pitch_line_score": 0.0,
     "scene_change_score": 0.0,
     **{name: 0.0 for name in GRID_FEATURE_NAMES},

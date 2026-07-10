@@ -27,6 +27,9 @@ LOW_GREEN_CONTEXT_THRESHOLD = 0.08
 BALL_CONTEXT_SECONDS = 6
 SCOREBOARD_HOLD_SECONDS = 4
 SCOREBOARD_MIN_GREEN_THRESHOLD = 0.06
+AD_BREAK_GREEN_THRESHOLD = 0.08
+AD_BREAK_LINE_THRESHOLD = 0.03
+AD_BREAK_SCENE_CHANGE_THRESHOLD = 0.55
 
 MUTE_AFTER_SECONDS = 2
 UNMUTE_AFTER_SECONDS = 2
@@ -59,6 +62,7 @@ FEATURE_NAMES = [
     "recent_context",
     "scoreboard_context",
     "scoreboard_support",
+    "ad_break_reset",
     "seconds_since_strong",
     "seconds_since_scoreboard",
     "pitch_line_score",
@@ -471,6 +475,23 @@ def scene_change_score(frame):
     return round(float(max(0.0, min(1.0, 1.0 - correlation))), 6)
 
 
+def ad_break_reset_signal(green, board, ball, line_score, scene_score):
+    return (
+        scene_score >= AD_BREAK_SCENE_CHANGE_THRESHOLD
+        and green <= AD_BREAK_GREEN_THRESHOLD
+        and line_score <= AD_BREAK_LINE_THRESHOLD
+        and not board
+        and not ball
+    )
+
+
+def visual_football_support(green, board, ball):
+    return (
+        green > LOW_GREEN_CONTEXT_THRESHOLD
+        or ((board or ball) and green > SCOREBOARD_MIN_GREEN_THRESHOLD)
+    )
+
+
 def regional_features(frame, previous_gray_frame):
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -782,6 +803,11 @@ def main():
             if strong_football:
                 last_strong_football_at = now
 
+            ad_break_reset = ad_break_reset_signal(green, board, ball, line_score, scene_score)
+            if ad_break_reset:
+                last_strong_football_at = None
+                last_scoreboard_at = None
+
             recent_match_context = (
                 last_strong_football_at is not None
                 and now - last_strong_football_at <= args.context_grace
@@ -804,7 +830,7 @@ def main():
                 and motion
                 and scoreboard_supported_by_match
             )
-            heuristic_football = strong_football or recent_match_context or scoreboard_match_context
+            heuristic_football = (strong_football or recent_match_context or scoreboard_match_context) and not ad_break_reset
             seconds_since_strong = (
                 UNKNOWN_SECONDS if last_strong_football_at is None else min(UNKNOWN_SECONDS, now - last_strong_football_at)
             )
@@ -823,6 +849,7 @@ def main():
                 "recent_context": int(recent_match_context),
                 "scoreboard_context": int(scoreboard_match_context),
                 "scoreboard_support": int(scoreboard_supported_by_match),
+                "ad_break_reset": int(ad_break_reset),
                 "seconds_since_strong": round(float(seconds_since_strong), 3),
                 "seconds_since_scoreboard": round(float(seconds_since_scoreboard), 3),
                 "pitch_line_score": round(float(line_score), 6),
@@ -838,7 +865,11 @@ def main():
                     log(f"model prediction failed, falling back to heuristics: {exc}")
                     classifier = None
 
-            football = model_prob >= args.model_threshold if model_prob is not None else heuristic_football
+            if model_prob is not None:
+                football = model_prob >= args.model_threshold and (heuristic_football or visual_football_support(green, board, ball))
+            else:
+                football = heuristic_football
+            football = football and not ad_break_reset
             heuristic_probability = 1.0 if heuristic_football else 0.0
 
             history.append(football)
@@ -863,6 +894,8 @@ def main():
                 f"Lines: {line_score:.2f} | SceneCut: {scene_score:.2f} | "
                 f"Context: {recent_match_context} | ScoreboardContext: {scoreboard_match_context} | "
                 f"ScoreboardSupport: {scoreboard_supported_by_match} | "
+                f"VisualSupport: {visual_football_support(green, board, ball)} | "
+                f"AdBreakReset: {ad_break_reset} | "
             )
             if model_prob is not None:
                 status_line += f"ModelProb: {model_prob:.2f} | "
