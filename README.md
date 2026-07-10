@@ -2,6 +2,18 @@
 
 Detects whether a browser stream is showing football or ads by sampling the screen, then fades browser audio down during ads and restores it instantly when football returns.
 
+## Table of contents
+
+- [Requirements](#requirements)
+- [Run](#run)
+- [Quickstart with starter model](#quickstart-with-starter-model)
+- [Local model workflow](#local-model-workflow)
+- [Self-training bootstrap](#self-training-bootstrap)
+- [Football-only anomaly model](#football-only-anomaly-model)
+- [Logs](#logs)
+- [Tuning](#tuning)
+- [Limitations](#limitations)
+
 ## Requirements
 
 - Windows
@@ -33,6 +45,25 @@ From this folder:
 ```powershell
 uv run --with opencv-python --with mss --with numpy --with pycaw python football_ad_muter.py --monitor 2 --duration 5400 --mute-after 2 --context-grace 4 --mute-fade 2 --no-debug
 ```
+
+## Quickstart with starter model
+
+This repo includes `models/football_one_class.joblib`, a starter one-class model trained on football/highlights screen captures. It learns "normal football" and treats sufficiently different screens as non-football.
+
+Run it against the monitor where the browser stream is visible:
+
+```powershell
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib --with scikit-learn python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.5 --mute-after 3 --record-data data/live-test --no-debug
+```
+
+Tune from there:
+
+- If it mutes during football, try `--model-threshold 0.45`.
+- If it misses non-football breaks, try `--model-threshold 0.55` or `0.6`.
+
+Only load `.joblib` model files from sources you trust. Joblib uses Python pickle under the hood.
+
+The included model is a starting point, not a universal detector. For best accuracy, collect and train on your own browser, monitor, broadcaster, resolution, and display-scaling setup.
 
 Useful options:
 
@@ -229,12 +260,13 @@ If muting feels too abrupt or too slow, adjust:
 
 ## Limitations
 
-- Detection is heuristic. It looks at screen pixels, not the video stream metadata, so unusual camera angles, overlays, graphics, and sponsor boards can confuse it.
-- Ads can be misclassified as football if they contain green backgrounds, high-motion sports clips, or scoreboard-like graphics near the top of the screen.
-- Football can be misclassified as ads during player closeups, crowd shots, replay transitions, dark scenes, or shots where the pitch and scoreboard are both missing.
-- The ball detector is experimental and noisy. It is logged for debugging, but it is not trusted as a standalone football signal.
-- The scoreboard detector can miss small, transparent, animated, or unusually placed scoreboards. It can also mistake dense ad graphics for a scoreboard.
-- Browser or DRM-protected video may capture as black, blank, or partially incorrect frames depending on hardware acceleration, browser settings, and the streaming site.
+- The detector looks at screen pixels, not video-stream metadata. Browser controls, end screens, buffering screens, overlays, menus, and DRM-protected/black captures can affect results.
+- The included `models/football_one_class.joblib` is a starter model trained on one local browser/monitor/broadcast setup. It should be retrained for different broadcasters, resolutions, scorebugs, display scaling, or viewing habits.
+- One-class mode learns "normal football" from football-only examples. It does not learn every possible ad or non-football state, so unusual football shots can look anomalous and sports-like ads can look normal.
+- Training with `--assume-label football` is only safe when the capture really contains football/highlights only. If menus, desktop windows, ads, or paused screens are recorded, the anomaly model can learn those as normal too.
+- The feature set is still visual and approximate. Green-pitch, pitch-line, scoreboard, motion, ball-ish, scene-change, and grid-layout signals can all be confused by replays, closeups, crowd shots, dark scenes, studio segments, sponsor boards, or fast highlight edits.
+- The ball detector is experimental and noisy. It is useful as one feature among many, not as a standalone football signal.
+- The scoreboard detector can miss small, transparent, animated, or unusually placed scoreboards. It can also mistake dense graphics for a scoreboard.
 - Audio control works at the browser session level. If multiple tabs are playing audio in the same browser, they may be faded or restored together.
 - If the process is force-stopped while audio is muted, Windows may leave the browser muted or at low volume. Restore it from the volume mixer if that happens.
-- The script was tuned around one match stream and monitor setup. Different broadcasters, resolutions, scoreboards, or display scaling may need threshold changes.
+- `.joblib` model files use pickle-style loading. Only load models from sources you trust.
