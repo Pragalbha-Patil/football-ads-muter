@@ -17,17 +17,31 @@ Detects whether a browser stream is showing football or ads by sampling the scre
 
 ## Requirements
 
-- Windows
 - `uv`
 - A Chromium/Firefox browser audio session
+- Windows, macOS, or Linux
 
 The script uses:
 
 - `opencv-python`
 - `mss`
 - `numpy`
-- `pycaw`
+- `pycaw` for Windows per-browser audio sessions
 - `scikit-learn` and `joblib` for local model training/inference
+
+Audio muting support:
+
+- Windows: per-browser session mute/restore through `pycaw`.
+- Linux: best-effort browser sink-input mute/restore through `pactl` with PulseAudio or PipeWire Pulse.
+- macOS: best-effort system output mute/restore through `osascript`.
+
+Linux package hints:
+
+- Debian/Ubuntu: `sudo apt install pulseaudio-utils`
+- Fedora: `sudo dnf install pulseaudio-utils`
+- Arch: `sudo pacman -S libpulse`
+
+On PipeWire systems, `pactl` usually talks to `pipewire-pulse`. macOS does not need an extra package for `osascript`.
 
 You do not need to install them manually when using the `uv run --with ...` command below.
 
@@ -53,7 +67,21 @@ macOS/Linux:
 curl -LsSf https://raw.githubusercontent.com/Pragalbha-Patil/football-ads-muter/master/scripts/bootstrap.sh | sh
 ```
 
-The app's browser-audio muting uses Windows audio sessions through `pycaw`. macOS/Linux can use the repo for data collection, labeling, and model training, but audio-session muting is not implemented there.
+If `curl` is not installed but `wget` is:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/Pragalbha-Patil/football-ads-muter/master/scripts/bootstrap.sh | sh
+```
+
+The bootstrap scripts install or update the repo and run `uv sync`. They also try to install missing prerequisites when the platform has a supported package manager:
+
+- Windows: installs Git through `winget` if needed, and installs `uv`.
+- Linux: installs missing `curl`, `git`, `uv`, and `pactl` where possible.
+- macOS: installs missing `curl`/`git` through Homebrew when available, and installs `uv`. `osascript` is built in.
+
+System package installation may ask for `sudo`, `doas`, administrator approval, or package-manager confirmation.
+
+Audio muting is most precise on Windows. Linux support requires `pactl` from packages such as `pulseaudio-utils` or `libpulse`. macOS support uses built-in `osascript` and currently changes the system output volume/mute state, not just the browser.
 
 ## Run
 
@@ -284,6 +312,7 @@ If muting feels too abrupt or too slow, adjust:
 - The feature set is still visual and approximate. Green-pitch, pitch-line, scoreboard, motion, ball-ish, scene-change, and grid-layout signals can all be confused by replays, closeups, crowd shots, dark scenes, studio segments, sponsor boards, or fast highlight edits.
 - The ball detector is experimental and noisy. It is useful as one feature among many, not as a standalone football signal.
 - The scoreboard detector can miss small, transparent, animated, or unusually placed scoreboards. It can also mistake dense graphics for a scoreboard.
-- Audio control works at the browser session level. If multiple tabs are playing audio in the same browser, they may be faded or restored together.
-- If the process is force-stopped while audio is muted, Windows may leave the browser muted or at low volume. Restore it from the volume mixer if that happens.
+- Audio control precision depends on the OS. Windows targets browser audio sessions, Linux targets browser sink inputs when `pactl` can see them, and macOS currently controls system output volume/mute.
+- If multiple tabs are playing audio in the same browser, they may be faded or restored together.
+- If the process is force-stopped while audio is muted, the browser or system audio may remain muted or at low volume. Restore it from the OS volume controls if that happens.
 - `.joblib` model files use pickle-style loading. Only load models from sources you trust.

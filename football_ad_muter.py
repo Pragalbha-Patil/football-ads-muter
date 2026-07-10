@@ -1,6 +1,10 @@
 import argparse
 import csv
 import json
+import platform
+import re
+import shutil
+import subprocess
 import time
 from collections import deque
 from datetime import datetime
@@ -82,72 +86,235 @@ def log(message):
 
 
 # -----------------------------
-# Windows mute
+# Cross-platform browser mute
 # -----------------------------
 
-try:
-    from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+BROWSER_PROCESS_NAMES = ("chrome", "chromium", "msedge", "edge", "firefox", "brave", "opera", "vivaldi")
+windows_browser_volumes = {}
+macos_volume_state = None
+linux_sink_states = {}
 
-    browser_volumes = {}
 
-    def browser_audio_sessions():
-        sessions = AudioUtilities.GetAllSessions()
+def browser_name_match(name):
+    clean = name.lower()
+    return any(browser in clean for browser in BROWSER_PROCESS_NAMES)
 
-        for session in sessions:
-            if session.Process:
-                name = session.Process.name().lower()
 
-                if "chrome" in name or "edge" in name or "firefox" in name:
-                    volume = session._ctl.QueryInterface(ISimpleAudioVolume)
-                    yield session.Process.pid, name, volume
+def windows_browser_audio_sessions():
+    try:
+        from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+    except Exception as exc:
+        log(f"pycaw unavailable for Windows browser audio control: {exc}")
+        return []
 
-    def mute_chrome(mute: bool, fade_seconds=MUTE_FADE_SECONDS):
-        sessions = list(browser_audio_sessions())
+    sessions = AudioUtilities.GetAllSessions()
+    browser_sessions = []
 
-        if not sessions:
-            log("no browser audio session found")
-            return
+    for session in sessions:
+        if session.Process:
+            name = session.Process.name().lower()
+            if browser_name_match(name):
+                volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                browser_sessions.append((session.Process.pid, name, volume))
 
-        if not mute:
-            for pid, _, volume in sessions:
-                volume.SetMute(False, None)
-                volume.SetMasterVolume(browser_volumes.get(pid, 1.0), None)
+    return browser_sessions
 
-            log("browser volume restored instantly")
-            return
 
-        starts = []
+def mute_windows_browsers(mute: bool, fade_seconds=MUTE_FADE_SECONDS):
+    sessions = windows_browser_audio_sessions()
+
+    if not sessions:
+        log("no browser audio session found")
+        return
+
+    if not mute:
         for pid, _, volume in sessions:
-            current = volume.GetMasterVolume()
-            browser_volumes.setdefault(pid, current)
             volume.SetMute(False, None)
-            starts.append((volume, current))
+            volume.SetMasterVolume(windows_browser_volumes.get(pid, 1.0), None)
 
-        steps = max(1, MUTE_FADE_STEPS)
-        delay = fade_seconds / steps if fade_seconds > 0 else 0
+        log("browser volume restored instantly")
+        return
 
-        for step in range(1, steps + 1):
-            factor = max(0.0, 1.0 - step / steps)
-            for volume, start in starts:
-                volume.SetMasterVolume(start * factor, None)
+    starts = []
+    for pid, _, volume in sessions:
+        current = volume.GetMasterVolume()
+        windows_browser_volumes.setdefault(pid, current)
+        volume.SetMute(False, None)
+        starts.append((volume, current))
 
-            log(f"browser volume fading down: {int(factor * 100)}%")
-            if delay:
-                time.sleep(delay)
+    steps = max(1, MUTE_FADE_STEPS)
+    delay = fade_seconds / steps if fade_seconds > 0 else 0
 
-        for volume, _ in starts:
-            volume.SetMasterVolume(0.0, None)
-            volume.SetMute(True, None)
+    for step in range(1, steps + 1):
+        factor = max(0.0, 1.0 - step / steps)
+        for volume, start in starts:
+            volume.SetMasterVolume(start * factor, None)
 
-        log("browser volume reached 0 and is muted")
+        log(f"browser volume fading down: {int(factor * 100)}%")
+        if delay:
+            time.sleep(delay)
 
-except Exception:
+    for volume, _ in starts:
+        volume.SetMasterVolume(0.0, None)
+        volume.SetMute(True, None)
 
-    def mute_chrome(mute: bool, fade_seconds=MUTE_FADE_SECONDS):
-        if mute:
-            log(f"MUTE fade requested over {fade_seconds}s")
+    log("browser volume reached 0 and is muted")
+
+
+def run_quiet(command):
+    return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+def macos_output_state():
+    result = run_quiet(["osascript", "-e", "output volume of (get volume settings)", "-e", "output muted of (get volume settings)"])
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "osascript failed")
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return int(lines[0]), lines[1].lower() == "true"
+
+
+def mute_macos_output(mute: bool, fade_seconds=MUTE_FADE_SECONDS):
+    global macos_volume_state
+
+    if shutil.which("osascript") is None:
+        log("osascript unavailable for macOS audio control")
+        return
+
+    if not mute:
+        if macos_volume_state is None:
+            run_quiet(["osascript", "-e", "set volume without output muted"])
+            log("macOS output unmuted")
+            return
+
+        volume, was_muted = macos_volume_state
+        run_quiet(["osascript", "-e", f"set volume output volume {volume}", "-e", f"set volume output muted {str(was_muted).lower()}"])
+        log("macOS output volume restored")
+        return
+
+    volume, was_muted = macos_output_state()
+    if macos_volume_state is None:
+        macos_volume_state = (volume, was_muted)
+
+    steps = max(1, MUTE_FADE_STEPS)
+    delay = fade_seconds / steps if fade_seconds > 0 else 0
+    for step in range(1, steps + 1):
+        factor = max(0.0, 1.0 - step / steps)
+        run_quiet(["osascript", "-e", f"set volume output volume {round(volume * factor)}"])
+        log(f"macOS output fading down: {int(factor * 100)}%")
+        if delay:
+            time.sleep(delay)
+
+    run_quiet(["osascript", "-e", "set volume output muted true"])
+    log("macOS output muted")
+
+
+def linux_browser_sink_inputs():
+    if shutil.which("pactl") is None:
+        log("pactl unavailable for Linux audio control")
+        return []
+
+    result = run_quiet(["pactl", "list", "sink-inputs"])
+    if result.returncode != 0:
+        log(f"pactl failed: {result.stderr.strip()}")
+        return []
+
+    inputs = []
+    current_index = None
+    current_lines = []
+
+    for line in result.stdout.splitlines():
+        match = re.match(r"Sink Input #(\d+)", line)
+        if match:
+            if current_index is not None and browser_name_match("\n".join(current_lines)):
+                inputs.append(current_index)
+            current_index = match.group(1)
+            current_lines = []
         else:
-            log("UNMUTE instantly requested")
+            current_lines.append(line)
+
+    if current_index is not None and browser_name_match("\n".join(current_lines)):
+        inputs.append(current_index)
+
+    return inputs
+
+
+def linux_sink_block(index):
+    result = run_quiet(["pactl", "list", "sink-inputs"])
+    if result.returncode != 0:
+        return ""
+
+    block = ""
+    capture = False
+    for line in result.stdout.splitlines():
+        if line.startswith(f"Sink Input #{index}"):
+            capture = True
+            block = line + "\n"
+            continue
+        if capture and line.startswith("Sink Input #"):
+            break
+        if capture:
+            block += line + "\n"
+
+    return block
+
+
+def linux_sink_state(index):
+    block = linux_sink_block(index)
+    match = re.search(r"Mute:\s+(yes|no)", block)
+    volume_match = re.search(r"Volume:.*?(\d+)%", block)
+    return {
+        "muted": bool(match and match.group(1) == "yes"),
+        "volume": f"{volume_match.group(1)}%" if volume_match else "100%",
+    }
+
+
+def mute_linux_browsers(mute: bool, fade_seconds=MUTE_FADE_SECONDS):
+    inputs = linux_browser_sink_inputs()
+
+    if not inputs:
+        log("no Linux browser sink input found")
+        return
+
+    if not mute:
+        for index in inputs:
+            previous = linux_sink_states.get(index, {"muted": False, "volume": "100%"})
+            run_quiet(["pactl", "set-sink-input-volume", index, previous["volume"]])
+            run_quiet(["pactl", "set-sink-input-mute", index, "1" if previous["muted"] else "0"])
+        log("Linux browser sink inputs restored")
+        return
+
+    for index in inputs:
+        linux_sink_states.setdefault(index, linux_sink_state(index))
+
+    steps = max(1, MUTE_FADE_STEPS)
+    delay = fade_seconds / steps if fade_seconds > 0 else 0
+    for step in range(1, steps + 1):
+        factor = max(0.0, 1.0 - step / steps)
+        for index in inputs:
+            run_quiet(["pactl", "set-sink-input-volume", index, f"{int(factor * 100)}%"])
+        log(f"Linux browser sink inputs fading down: {int(factor * 100)}%")
+        if delay:
+            time.sleep(delay)
+
+    for index in inputs:
+        run_quiet(["pactl", "set-sink-input-mute", index, "1"])
+    log("Linux browser sink inputs muted")
+
+
+def mute_chrome(mute: bool, fade_seconds=MUTE_FADE_SECONDS):
+    system = platform.system()
+
+    if system == "Windows":
+        mute_windows_browsers(mute, fade_seconds)
+    elif system == "Darwin":
+        mute_macos_output(mute, fade_seconds)
+    elif system == "Linux":
+        mute_linux_browsers(mute, fade_seconds)
+    elif mute:
+        log(f"MUTE fade requested over {fade_seconds}s, but {system} audio control is unsupported")
+    else:
+        log(f"UNMUTE requested, but {system} audio control is unsupported")
 
 
 # -----------------------------
