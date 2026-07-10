@@ -5,6 +5,7 @@ Detects whether a browser stream is showing football or ads by sampling the scre
 ## Table of contents
 
 - [Requirements](#requirements)
+- [Install from GitHub](#install-from-github)
 - [Run](#run)
 - [Quickstart with starter model](#quickstart-with-starter-model)
 - [Local model workflow](#local-model-workflow)
@@ -37,6 +38,22 @@ If you prefer a project environment instead of per-command dependencies:
 ```powershell
 uv sync
 ```
+
+## Install from GitHub
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Pragalbha-Patil/football-ads-muter/master/scripts/bootstrap.ps1 | iex
+```
+
+macOS/Linux:
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/Pragalbha-Patil/football-ads-muter/master/scripts/bootstrap.sh | sh
+```
+
+The app's browser-audio muting uses Windows audio sessions through `pycaw`. macOS/Linux can use the repo for data collection, labeling, and model training, but audio-session muting is not implemented there.
 
 ## Run
 
