@@ -1,6 +1,10 @@
 import argparse
+import csv
+import json
 import time
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import mss
@@ -26,6 +30,36 @@ MUTE_FADE_SECONDS = 2.0
 MUTE_FADE_STEPS = 8
 
 SHOW_DEBUG = True
+
+MODEL_THRESHOLD = 0.65
+UNKNOWN_SECONDS = 999.0
+
+FEATURE_NAMES = [
+    "green",
+    "scoreboard",
+    "board_density",
+    "board_tile",
+    "motion_score",
+    "motion",
+    "ball",
+    "replay_rule",
+    "recent_context",
+    "scoreboard_context",
+    "scoreboard_support",
+    "seconds_since_strong",
+    "seconds_since_scoreboard",
+]
+
+CSV_FIELDS = [
+    "timestamp",
+    "frame",
+    *FEATURE_NAMES,
+    "heuristic_probability",
+    "model_probability",
+    "predicted",
+    "muted",
+    "label",
+]
 
 
 def log(message):
@@ -206,22 +240,129 @@ def ball_present(frame):
 previous = None
 
 
-def crowd_motion(frame):
+def crowd_motion_score(frame):
     global previous
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     if previous is None:
         previous = gray
-        return True
+        return 999.0
 
     diff = cv2.absdiff(previous, gray)
 
     previous = gray
 
-    motion = np.mean(diff)
+    return float(np.mean(diff))
 
-    return motion > 4
+
+def crowd_motion(frame):
+    return crowd_motion_score(frame) > 4
+
+
+def load_classifier(path):
+    if not path:
+        return None
+
+    try:
+        import joblib
+    except Exception as exc:
+        log(f"could not import joblib for model loading: {exc}")
+        return None
+
+    model_path = Path(path)
+    try:
+        bundle = joblib.load(model_path)
+    except Exception as exc:
+        log(f"could not load model from {model_path}: {exc}")
+        return None
+
+    if not isinstance(bundle, dict) or "model" not in bundle:
+        log(f"model file {model_path} is not a football classifier bundle")
+        return None
+
+    missing = [name for name in FEATURE_NAMES if name not in bundle.get("feature_names", [])]
+    if missing:
+        log(f"model file is missing expected features: {', '.join(missing)}")
+        return None
+
+    log(f"loaded local classifier from {model_path}")
+    return bundle
+
+
+def model_probability(bundle, features):
+    model = bundle["model"]
+    feature_names = bundle["feature_names"]
+    labels = list(bundle.get("labels", []))
+    values = [[features[name] for name in feature_names]]
+
+    if hasattr(model, "predict_proba") and "football" in labels:
+        probabilities = model.predict_proba(values)[0]
+        return float(probabilities[labels.index("football")])
+
+    prediction = model.predict(values)[0]
+    return 1.0 if prediction == "football" else 0.0
+
+
+def prepare_recorder(record_dir, args):
+    if not record_dir:
+        return None
+
+    root = Path(record_dir)
+    frames_dir = root / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = root / "labels.csv"
+    needs_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    handle = csv_path.open("a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+
+    if needs_header:
+        writer.writeheader()
+
+    metadata_path = root / "recording_config.json"
+    metadata = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "fps": FPS,
+        "feature_names": FEATURE_NAMES,
+        "args": vars(args),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    log(f"recording training data to {root}")
+    return {
+        "root": root,
+        "frames_dir": frames_dir,
+        "handle": handle,
+        "writer": writer,
+    }
+
+
+def record_sample(recorder, frame, features, heuristic_probability, model_prob, predicted, muted):
+    if not recorder:
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    filename = f"{timestamp}.jpg"
+    frame_path = recorder["frames_dir"] / filename
+    cv2.imwrite(str(frame_path), frame)
+
+    row = {
+        "timestamp": timestamp,
+        "frame": f"frames/{filename}",
+        "heuristic_probability": round(heuristic_probability, 5),
+        "model_probability": "" if model_prob is None else round(model_prob, 5),
+        "predicted": predicted,
+        "muted": int(muted),
+        "label": "",
+    }
+    row.update({name: features[name] for name in FEATURE_NAMES})
+    recorder["writer"].writerow(row)
+    recorder["handle"].flush()
+
+
+def close_recorder(recorder):
+    if recorder:
+        recorder["handle"].close()
 
 
 def parse_args():
@@ -257,6 +398,24 @@ def parse_args():
         help="Fade browser volume to zero over this many seconds when muting.",
     )
     parser.add_argument(
+        "--record-data",
+        type=str,
+        default=None,
+        help="Directory where frames and labels.csv should be saved for local training.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to a trained local classifier .joblib file. Uses heuristics if omitted or unavailable.",
+    )
+    parser.add_argument(
+        "--model-threshold",
+        type=float,
+        default=MODEL_THRESHOLD,
+        help="Minimum model football probability required to treat a frame as football.",
+    )
+    parser.add_argument(
         "--no-debug",
         action="store_true",
         help="Disable the OpenCV debug preview window.",
@@ -267,6 +426,8 @@ def parse_args():
 def main():
     args = parse_args()
     show_debug = SHOW_DEBUG and not args.no_debug
+    classifier = load_classifier(args.model)
+    recorder = prepare_recorder(args.record_data, args)
 
     sct = mss.MSS()
     if args.monitor is None:
@@ -290,6 +451,8 @@ def main():
         f"duration={args.duration or 'until stopped'}s | "
         f"mute_after={args.mute_after}s | context_grace={args.context_grace}s | "
         f"mute_fade={args.mute_fade}s | "
+        f"model={'on' if classifier else 'off'} | "
+        f"recording={'on' if recorder else 'off'} | "
         f"debug_window={show_debug}"
     )
 
@@ -304,7 +467,8 @@ def main():
 
             green = pitch_score(frame)
             board, board_density, board_tile = scoreboard_present(frame)
-            motion = crowd_motion(frame)
+            motion_score = crowd_motion_score(frame)
+            motion = motion_score > 4
             ball = ball_present(frame)
             now = time.monotonic()
 
@@ -340,7 +504,39 @@ def main():
                 and motion
                 and scoreboard_supported_by_match
             )
-            football = strong_football or recent_match_context or scoreboard_match_context
+            heuristic_football = strong_football or recent_match_context or scoreboard_match_context
+            seconds_since_strong = (
+                UNKNOWN_SECONDS if last_strong_football_at is None else min(UNKNOWN_SECONDS, now - last_strong_football_at)
+            )
+            seconds_since_scoreboard = (
+                UNKNOWN_SECONDS if last_scoreboard_at is None else min(UNKNOWN_SECONDS, now - last_scoreboard_at)
+            )
+            features = {
+                "green": round(float(green), 6),
+                "scoreboard": int(board),
+                "board_density": round(float(board_density), 6),
+                "board_tile": round(float(board_tile), 6),
+                "motion_score": round(float(motion_score), 6),
+                "motion": int(motion),
+                "ball": int(ball),
+                "replay_rule": int(replay_or_close_play),
+                "recent_context": int(recent_match_context),
+                "scoreboard_context": int(scoreboard_match_context),
+                "scoreboard_support": int(scoreboard_supported_by_match),
+                "seconds_since_strong": round(float(seconds_since_strong), 3),
+                "seconds_since_scoreboard": round(float(seconds_since_scoreboard), 3),
+            }
+
+            model_prob = None
+            if classifier:
+                try:
+                    model_prob = model_probability(classifier, features)
+                except Exception as exc:
+                    log(f"model prediction failed, falling back to heuristics: {exc}")
+                    classifier = None
+
+            football = model_prob >= args.model_threshold if model_prob is not None else heuristic_football
+            heuristic_probability = 1.0 if heuristic_football else 0.0
 
             history.append(football)
             seen_football = seen_football or football
@@ -356,14 +552,27 @@ def main():
                     mute_chrome(False)
                     muted = False
 
-            log(
+            status_line = (
                 f"{'FOOTBALL' if football else 'ADS'} | "
                 f"Pitch: {green:.2f} | Scoreboard: {board} | Motion: {motion} | "
                 f"BoardDensity: {board_density:.3f} | BoardTile: {board_tile:.3f} | "
                 f"Ball: {ball} | ReplayRule: {replay_or_close_play} | "
                 f"Context: {recent_match_context} | ScoreboardContext: {scoreboard_match_context} | "
                 f"ScoreboardSupport: {scoreboard_supported_by_match} | "
-                f"Muted: {muted}"
+            )
+            if model_prob is not None:
+                status_line += f"ModelProb: {model_prob:.2f} | "
+            status_line += f"Muted: {muted}"
+            log(status_line)
+
+            record_sample(
+                recorder,
+                frame,
+                features,
+                heuristic_probability,
+                model_prob,
+                "football" if football else "ad",
+                muted,
             )
 
             if show_debug:
@@ -433,6 +642,7 @@ def main():
         if muted:
             log("restoring browser audio before exit")
             mute_chrome(False)
+        close_recorder(recorder)
         cv2.destroyAllWindows()
         log("detector stopped")
 
