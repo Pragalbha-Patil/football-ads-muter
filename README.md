@@ -20,6 +20,12 @@ You do not need to install them manually when using the `uv run --with ...` comm
 
 Recorded screenshots, logs, and trained model files are intentionally ignored by Git. They can contain private screen contents and should stay local unless you explicitly choose to share them.
 
+If you prefer a project environment instead of per-command dependencies:
+
+```powershell
+uv sync
+```
+
 ## Run
 
 From this folder:
@@ -137,7 +143,7 @@ The trainer prints label counts and, when there are enough examples, a validatio
 ### 4. Run with the trained model
 
 ```powershell
-uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib python football_ad_muter.py --monitor 2 --duration 5400 --model models/football_ad_classifier.joblib --model-threshold 0.65 --record-data data/session-2 --no-debug
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib --with scikit-learn python football_ad_muter.py --monitor 2 --duration 5400 --model models/football_ad_classifier.joblib --model-threshold 0.65 --record-data data/session-2 --no-debug
 ```
 
 Keeping `--record-data` on while using the model lets you collect the next batch of examples. Label mistakes and uncertain cases, retrain, then run again.
@@ -179,7 +185,7 @@ uv run --with scikit-learn --with joblib python train_one_class.py data/football
 Run with it:
 
 ```powershell
-uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.5 --record-data data/football-only/session-2 --no-debug
+uv run --with opencv-python --with mss --with numpy --with pycaw --with joblib --with scikit-learn python football_ad_muter.py --monitor 2 --model models/football_one_class.joblib --model-threshold 0.5 --record-data data/football-only/session-2 --no-debug
 ```
 
 ## Logs
